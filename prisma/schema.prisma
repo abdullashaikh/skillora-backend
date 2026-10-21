@@ -1,0 +1,296 @@
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum ProviderType {
+  OPENAI
+  GEMINI
+}
+
+enum AnalysisStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+model User {
+  id              String          @id @default(uuid())
+  email           String          @unique
+  name            String?
+  passwordHash    String
+  role            Role            @default(USER)
+  isActive        Boolean         @default(true)
+  isEmailVerified Boolean         @default(false)
+  emailVerifiedAt DateTime?
+  accountStatus   String          @default("ACTIVE") // ACTIVE, SUSPENDED, DELETED
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  resumes             Resume[]
+  resumeAnalyses      ResumeAnalysis[]
+  auditLogs           AdminAuditLog[]
+  verificationTokens  VerificationToken[]
+  passwordResetTokens PasswordResetToken[]
+
+  @@map("users")
+}
+
+model Skill {
+  id             String    @id @default(uuid())
+  canonicalName  String    @unique
+  normalizedName String    @unique
+  category       String    // e.g. "Programming Languages", "Frameworks & Libraries", "Databases", "Cloud & DevOps", "Tools"
+  aliases        String    @db.Text // JSON array of aliases: ["js", "ecmascript"]
+  isActive       Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  analysisSkills ResumeAnalysisSkill[]
+
+  @@index([category])
+  @@index([normalizedName])
+  @@map("skills")
+}
+
+model Resume {
+  id             String    @id @default(uuid())
+  userId         String?
+  guestSessionId String?
+  storagePath    String?   // internal path, never exposed
+  originalName   String    // sanitized display name only
+  mimeType       String
+  fileSize       Int
+  pageCount      Int?
+  extractedText  String?   @db.MediumText
+  expiresAt      DateTime? // guest files expire automatically
+  createdAt      DateTime  @default(now())
+
+  user           User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  analyses       ResumeAnalysis[]
+
+  @@index([userId])
+  @@index([guestSessionId])
+  @@index([expiresAt])
+  @@map("resumes")
+}
+
+model ResumeAnalysis {
+  id                   String          @id @default(uuid())
+  userId               String?
+  guestSessionId       String?
+  resumeId             String?
+  status               AnalysisStatus  @default(PENDING)
+  schemaVersion        String          @default("1.0")
+  providerUsed         String?
+  modelUsed            String?
+  promptTemplateVersion Int            @default(1)
+  scoringConfigVersion  Int            @default(1)
+  targetJobDescription String?         @db.Text
+  targetRole           String?
+  
+  // Scores
+  qualityScore         Int?            // 0 - 100
+  jobMatchScore        Int?            // 0 - 100 (null if no job description)
+  scoreBreakdown       String?         @db.Text // JSON with dimension scores, explanations, suggestions
+  
+  // Extracted structured profile
+  extractedProfile     String?         @db.MediumText // JSON representation of full structured profile
+  
+  warnings             String?         @db.Text // JSON array of warnings
+  isGuest              Boolean         @default(false)
+  expiresAt            DateTime?       // for guest reports
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+
+  user                 User?           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  resume               Resume?         @relation(fields: [resumeId], references: [id], onDelete: SetNull)
+  skills               ResumeAnalysisSkill[]
+  usageLogs            AIUsageLog[]
+
+  @@index([userId])
+  @@index([guestSessionId])
+  @@index([expiresAt])
+  @@index([createdAt])
+  @@map("resume_analyses")
+}
+
+model ResumeAnalysisSkill {
+  id               String          @id @default(uuid())
+  analysisId       String
+  skillId          String?
+  rawName          String
+  canonicalName    String
+  category         String
+  evidence         String?         @db.Text
+  sourceSection    String?         // e.g. "skills", "experience", "projects", "education"
+  confidence       Float           @default(1.0)
+  isExplicit       Boolean         @default(true) // explicit mention vs contextual inference
+
+  analysis         ResumeAnalysis  @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  skill            Skill?          @relation(fields: [skillId], references: [id], onDelete: SetNull)
+
+  @@index([analysisId])
+  @@index([skillId])
+  @@map("resume_analysis_skills")
+}
+
+model AIProviderConfig {
+  id                   String        @id @default(uuid())
+  provider             ProviderType  @unique
+  modelId              String
+  isActive             Boolean       @default(false)
+  encryptedKey         String?       @db.Text // AES-256-GCM encrypted ciphertext
+  iv                   String?       // Hex encoded IV
+  authTag              String?       // Hex encoded auth tag
+  keyMasked            String?       // e.g. "sk-••••abcd" or "AIza••••1234"
+  isConfigured         Boolean       @default(false)
+  lastTestedAt         DateTime?
+  lastTestStatus       String?       // "SUCCESS" | "FAILED"
+  lastTestMessage      String?       @db.Text
+  updatedBy            String?
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  @@map("ai_provider_configs")
+}
+
+model AIUsageLog {
+  id                String          @id @default(uuid())
+  provider          String
+  model             String
+  analysisId        String?
+  userId            String?
+  isGuest           Boolean         @default(false)
+  durationMs        Int
+  status            String          // "SUCCESS" | "FAILED"
+  providerRequestId String?
+  inputTokens       Int?
+  outputTokens      Int?
+  totalTokens       Int?
+  estimatedCostUsd  Float?
+  errorMessage      String?         @db.Text
+  createdAt         DateTime        @default(now())
+
+  analysis          ResumeAnalysis? @relation(fields: [analysisId], references: [id], onDelete: SetNull)
+
+  @@index([provider])
+  @@index([createdAt])
+  @@index([analysisId])
+  @@map("ai_usage_logs")
+}
+
+model AdminAuditLog {
+  id           String    @id @default(uuid())
+  adminId      String?
+  adminEmail   String
+  action       String    // e.g. "UPDATE_AI_CONFIG", "TEST_AI_CONFIG", "ACTIVATE_PROVIDER", "UPDATE_PROMPT", "UPDATE_SCORING"
+  resourceType String    // e.g. "AI_CONFIG", "PROMPT_TEMPLATE", "SCORING_CONFIG", "SYSTEM_SETTING"
+  resourceId   String?
+  details      String?   @db.Text
+  ipAddress    String?
+  outcome      String    @default("SUCCESS")
+  createdAt    DateTime  @default(now())
+
+  admin        User?     @relation(fields: [adminId], references: [id], onDelete: SetNull)
+
+  @@index([adminEmail])
+  @@index([action])
+  @@index([createdAt])
+  @@map("admin_audit_logs")
+}
+
+model PromptTemplate {
+  id                   String    @id @default(uuid())
+  version              Int       @unique
+  name                 String
+  systemPrompt         String    @db.MediumText
+  schemaVersion        String    @default("1.0")
+  isCurrent            Boolean   @default(false)
+  changeNotes          String?   @db.Text
+  createdBy            String?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@index([isCurrent])
+  @@map("prompt_templates")
+}
+
+model ScoringConfig {
+  id                   String    @id @default(uuid())
+  version              Int       @unique
+  name                 String
+  qualityWeights       String    @db.Text
+  jobMatchWeights      String    @db.Text
+  isCurrent            Boolean   @default(false)
+  changeNotes          String?   @db.Text
+  createdBy            String?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@index([isCurrent])
+  @@map("scoring_configs")
+}
+
+model SystemSetting {
+  id                   String    @id @default(uuid())
+  key                  String    @unique
+  value                String    @db.Text
+  description          String?
+  updatedAt            DateTime  @updatedAt
+
+  @@map("system_settings")
+}
+
+model VerificationToken {
+  id         String    @id @default(uuid())
+  userId     String
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("verification_tokens")
+}
+
+model PasswordResetToken {
+  id         String    @id @default(uuid())
+  userId     String
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("password_reset_tokens")
+}
+
+model GuestSession {
+  id         String    @id @default(uuid())
+  sessionId  String    @unique
+  usageCount Int       @default(0)
+  ipAddress  String?
+  expiresAt  DateTime
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@index([sessionId])
+  @@map("guest_sessions")
+}
