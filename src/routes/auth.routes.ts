@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { prisma } from '../lib/db.js';
 import { setAuthCookie, clearAuthCookie, requireAuth } from '../lib/auth/session.js';
 import { EmailService } from '../lib/email/email-service.js';
+import { GoogleAuthService } from '../lib/auth/google-auth-service.js';
 
 const router = Router();
 
@@ -37,11 +38,22 @@ const ResetPasswordSchema = z.object({
 
 /**
  * Helper to safely claim pending guest resumes and analyses into an authenticated account.
+ * Returns the most recent analysisId if one was claimed.
  */
-async function claimGuestData(userId: string, guestSessionId: string | undefined) {
-  if (!guestSessionId) return;
+async function claimGuestData(userId: string, guestSessionId: string | undefined): Promise<string | null> {
+  if (!guestSessionId) return null;
   try {
     const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const pendingAnalysis = await prisma.resumeAnalysis.findFirst({
+      where: {
+        guestSessionId,
+        userId: null,
+        createdAt: { gte: oneDayAgo },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    });
+
     await prisma.resumeAnalysis.updateMany({
       where: {
         guestSessionId,
@@ -58,8 +70,11 @@ async function claimGuestData(userId: string, guestSessionId: string | undefined
       },
       data: { userId },
     });
+
+    return pendingAnalysis?.id || null;
   } catch (err) {
     console.error('[Claim Guest Data Error]:', err);
+    return null;
   }
 }
 
@@ -155,8 +170,14 @@ router.post('/login', async (req: Request, res: Response) => {
       where: { email: normalizedEmail },
     });
 
-    if (!user || !user.isActive) {
+    if (!user || !user.isActive || user.accountStatus === 'SUSPENDED' || user.accountStatus === 'DELETED') {
       return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+
+    if (!user.passwordHash) {
+      return res.status(401).json({
+        error: 'This account was created with Google sign-in. Please sign in with Google.',
+      });
     }
 
     const passwordMatch = await bcrypt.compare(password, user.passwordHash);
@@ -198,12 +219,311 @@ router.post('/logout', (_req: Request, res: Response) => {
 });
 
 // GET /api/auth/me
-router.get('/me', (req: Request, res: Response) => {
-  return res.json({
-    user: req.auth?.user || null,
-    isGuest: req.auth?.isGuest ?? true,
+router.get('/me', async (req: Request, res: Response) => {
+  if (!req.auth?.user) {
+    return res.json({
+      user: null,
+      isGuest: true,
+      guestSessionId: req.auth?.guestSessionId,
+    });
+  }
+
+  try {
+    const dbUser = await prisma.user.findUnique({
+      where: { id: req.auth.user.id },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        role: true,
+        isEmailVerified: true,
+        passwordHash: true,
+        identities: {
+          select: { provider: true, createdAt: true },
+        },
+      },
+    });
+
+    if (!dbUser) {
+      return res.json({
+        user: null,
+        isGuest: true,
+        guestSessionId: req.auth?.guestSessionId,
+      });
+    }
+
+    return res.json({
+      user: {
+        id: dbUser.id,
+        email: dbUser.email,
+        name: dbUser.name,
+        role: dbUser.role,
+        isEmailVerified: dbUser.isEmailVerified,
+        hasPassword: Boolean(dbUser.passwordHash),
+        identities: dbUser.identities,
+      },
+      isGuest: false,
+      guestSessionId: req.auth?.guestSessionId,
+    });
+  } catch {
+    return res.json({
+      user: req.auth.user,
+      isGuest: false,
+      guestSessionId: req.auth?.guestSessionId,
+    });
+  }
+});
+
+// GET /api/auth/google/status
+router.get('/google/status', (_req: Request, res: Response) => {
+  return res.json(GoogleAuthService.getPublicConfig());
+});
+
+// GET /api/auth/google
+router.get('/google', (req: Request, res: Response) => {
+  const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+
+  if (!GoogleAuthService.isConfigured()) {
+    return res.redirect(`${clientUrl}/login?error=google_not_configured`);
+  }
+
+  const rawRedirect = req.query.redirect as string | undefined;
+  const returnUrl = GoogleAuthService.sanitizeRedirectUrl(rawRedirect);
+  const action = req.query.action === 'link' ? 'link' : 'login';
+
+  const { stateToken } = GoogleAuthService.generateState({
+    returnUrl,
     guestSessionId: req.auth?.guestSessionId,
+    action,
   });
+
+  // Store state in secure HTTP-only cookie with 15-minute lifetime
+  res.cookie('oauth_state', stateToken, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 15 * 60 * 1000,
+    path: '/',
+  });
+
+  const authUrl = GoogleAuthService.generateAuthUrl(stateToken);
+  return res.redirect(authUrl);
+});
+
+// GET /api/auth/google/callback
+router.get('/google/callback', async (req: Request, res: Response) => {
+  const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+
+  // Check for cancellation or provider error
+  if (req.query.error) {
+    res.clearCookie('oauth_state', { path: '/' });
+    const errCode = req.query.error === 'access_denied' ? 'google_cancelled' : 'google_error';
+    return res.redirect(`${clientUrl}/login?error=${errCode}`);
+  }
+
+  const code = req.query.code as string | undefined;
+  const state = req.query.state as string | undefined;
+  const storedState = req.cookies?.oauth_state;
+
+  res.clearCookie('oauth_state', { path: '/' });
+
+  if (!code || !state || !storedState || state !== storedState) {
+    return res.redirect(`${clientUrl}/login?error=invalid_oauth_state`);
+  }
+
+  const decodedState = GoogleAuthService.verifyState(state);
+  if (!decodedState) {
+    return res.redirect(`${clientUrl}/login?error=expired_oauth_state`);
+  }
+
+  try {
+    // 1. Exchange code for verified Google identity
+    const googleUser = await GoogleAuthService.exchangeCodeAndVerify(code);
+
+    // 2. Check for existing Google UserIdentity
+    const existingIdentity = await prisma.userIdentity.findUnique({
+      where: {
+        provider_providerSubject: {
+          provider: 'google',
+          providerSubject: googleUser.sub,
+        },
+      },
+      include: { user: true },
+    });
+
+    if (existingIdentity) {
+      const user = existingIdentity.user;
+      if (!user.isActive || user.accountStatus === 'SUSPENDED' || user.accountStatus === 'DELETED') {
+        return res.redirect(`${clientUrl}/login?error=account_suspended`);
+      }
+
+      await prisma.userIdentity.update({
+        where: { id: existingIdentity.id },
+        data: {
+          lastLoginAt: new Date(),
+          providerEmail: googleUser.email,
+        },
+      });
+
+      // Update email verification if Google verified and user was previously unverified
+      if (!user.isEmailVerified && googleUser.emailVerified) {
+        await prisma.user.update({
+          where: { id: user.id },
+          data: { isEmailVerified: true, emailVerifiedAt: new Date() },
+        });
+      }
+
+      const claimedId = await claimGuestData(user.id, decodedState.guestSessionId || req.auth?.guestSessionId);
+
+      setAuthCookie(res, {
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+      });
+
+      const dest = claimedId ? `/analysis/${claimedId}` : (decodedState.returnUrl || '/dashboard');
+      return res.redirect(`${clientUrl}${dest}`);
+    }
+
+    // 3. Check if an account with this email already exists
+    const existingEmailUser = await prisma.user.findUnique({
+      where: { email: googleUser.email },
+      include: { identities: true },
+    });
+
+    if (existingEmailUser) {
+      // If user is ALREADY authenticated in the current session (or explicit linking flow), link securely
+      const currentLoggedInId = req.auth?.user?.id;
+      if (currentLoggedInId && currentLoggedInId === existingEmailUser.id) {
+        await prisma.userIdentity.create({
+          data: {
+            userId: existingEmailUser.id,
+            provider: 'google',
+            providerIssuer: 'https://accounts.google.com',
+            providerSubject: googleUser.sub,
+            providerEmail: googleUser.email,
+          },
+        });
+
+        if (!existingEmailUser.isEmailVerified && googleUser.emailVerified) {
+          await prisma.user.update({
+            where: { id: existingEmailUser.id },
+            data: { isEmailVerified: true, emailVerifiedAt: new Date() },
+          });
+        }
+
+        const claimedId = await claimGuestData(existingEmailUser.id, decodedState.guestSessionId || req.auth?.guestSessionId);
+        setAuthCookie(res, {
+          userId: existingEmailUser.id,
+          email: existingEmailUser.email,
+          role: existingEmailUser.role,
+        });
+
+        const dest = claimedId ? `/analysis/${claimedId}` : (decodedState.returnUrl || '/dashboard');
+        return res.redirect(`${clientUrl}${dest}?linked=google`);
+      }
+
+      // Security requirement: DO NOT auto-link without authentication!
+      // Require the user to authenticate to the existing account first
+      return res.redirect(
+        `${clientUrl}/login?error=account_exists_link_required&email=${encodeURIComponent(googleUser.email)}`
+      );
+    }
+
+    // 4. Create new User with linked Google Identity
+    const isVerified = Boolean(googleUser.emailVerified);
+    const newUser = await prisma.user.create({
+      data: {
+        email: googleUser.email,
+        name: googleUser.name || null,
+        passwordHash: null,
+        role: 'USER',
+        isEmailVerified: isVerified,
+        emailVerifiedAt: isVerified ? new Date() : null,
+        accountStatus: 'ACTIVE',
+        identities: {
+          create: {
+            provider: 'google',
+            providerIssuer: 'https://accounts.google.com',
+            providerSubject: googleUser.sub,
+            providerEmail: googleUser.email,
+          },
+        },
+      },
+    });
+
+    if (!isVerified) {
+      // If Google did not verify the email, create verification token and send email
+      const { token, tokenHash } = EmailService.generateSecureToken();
+      await prisma.verificationToken.create({
+        data: {
+          userId: newUser.id,
+          tokenHash,
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        },
+      });
+      await EmailService.sendVerificationEmail(newUser.email, newUser.name, token);
+    }
+
+    const claimedId = await claimGuestData(newUser.id, decodedState.guestSessionId || req.auth?.guestSessionId);
+
+    setAuthCookie(res, {
+      userId: newUser.id,
+      email: newUser.email,
+      role: newUser.role,
+    });
+
+    let dest = '/dashboard';
+    if (claimedId) {
+      dest = `/analysis/${claimedId}`;
+    } else if (!isVerified) {
+      dest = '/verification-pending';
+    } else if (decodedState.returnUrl) {
+      dest = decodedState.returnUrl;
+    }
+
+    return res.redirect(`${clientUrl}${dest}`);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Google authentication failed';
+    console.error('[Google Auth Callback Error]:', err);
+    return res.redirect(`${clientUrl}/login?error=google_failed&detail=${encodeURIComponent(message.slice(0, 80))}`);
+  }
+});
+
+// POST /api/auth/google/unlink
+router.post('/google/unlink', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = req.auth!.user!.id;
+    const dbUser = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { identities: true },
+    });
+
+    if (!dbUser) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    const googleIdentity = dbUser.identities.find((i) => i.provider === 'google');
+    if (!googleIdentity) {
+      return res.status(400).json({ error: 'No Google account is linked to this user.' });
+    }
+
+    // Require that the user has a password set so they don't lock themselves out
+    if (!dbUser.passwordHash) {
+      return res.status(400).json({
+        error: 'You must set an account password before unlinking your Google account.',
+      });
+    }
+
+    await prisma.userIdentity.delete({
+      where: { id: googleIdentity.id },
+    });
+
+    return res.json({ success: true, message: 'Google account unlinked successfully.' });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to unlink Google account.';
+    return res.status(500).json({ error: message });
+  }
 });
 
 // POST /api/auth/verify-email

@@ -28,7 +28,7 @@ model User {
   id              String          @id @default(uuid())
   email           String          @unique
   name            String?
-  passwordHash    String
+  passwordHash    String?
   role            Role            @default(USER)
   isActive        Boolean         @default(true)
   isEmailVerified Boolean         @default(false)
@@ -42,8 +42,26 @@ model User {
   auditLogs           AdminAuditLog[]
   verificationTokens  VerificationToken[]
   passwordResetTokens PasswordResetToken[]
+  identities          UserIdentity[]
 
   @@map("users")
+}
+
+model UserIdentity {
+  id              String    @id @default(uuid())
+  userId          String
+  provider        String    // e.g. "google"
+  providerIssuer  String    // e.g. "https://accounts.google.com"
+  providerSubject String    // Google unique 'sub' claim
+  providerEmail   String?
+  createdAt       DateTime  @default(now())
+  lastLoginAt     DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerSubject])
+  @@index([userId])
+  @@map("user_identities")
 }
 
 model Skill {
@@ -56,7 +74,11 @@ model Skill {
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
-  analysisSkills ResumeAnalysisSkill[]
+  analysisSkills     ResumeAnalysisSkill[]
+  questions          Question[]
+  sourceTechnologies ContentSourceTechnology[]
+  importItems        ContentImportItem[]
+  coverageTasks      ContentCoverageTask[]
 
   @@index([category])
   @@index([normalizedName])
@@ -293,4 +315,284 @@ model GuestSession {
 
   @@index([sessionId])
   @@map("guest_sessions")
+}
+
+// ==========================================
+// Phase 2: Interview Q&A Collection & Bank
+// ==========================================
+
+enum SourceType {
+  GITHUB_REPO
+  GITHUB_FILE
+  WEBSITE
+  MANUAL
+}
+
+enum ContentReuseStatus {
+  PERMITTED
+  METADATA_ONLY
+  RESTRICTED
+}
+
+enum ParserType {
+  AUTO
+  MARKDOWN_HEADINGS
+  JSON_SCHEMA
+  CSV_MAPPING
+  HTML_SELECTORS
+}
+
+enum SyncFrequency {
+  MONTHLY
+  MANUAL
+}
+
+enum SourceStatus {
+  DRAFT
+  AWAITING_PERMISSION_REVIEW
+  READY
+  COLLECTING
+  PARSING
+  AWAITING_CONTENT_REVIEW
+  PUBLISHED
+  FAILED
+  DISABLED
+}
+
+enum ReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  ARCHIVED
+}
+
+enum DifficultyLevel {
+  BEGINNER
+  INTERMEDIATE
+  ADVANCED
+  UNKNOWN
+}
+
+enum QuestionType {
+  SHORT_ANSWER
+  MULTIPLE_CHOICE
+  CODE_OUTPUT
+  DEBUGGING
+  OPEN_ENDED
+}
+
+model ContentSource {
+  id                 String              @id @default(uuid())
+  name               String
+  sourceType         SourceType
+  url                String?             @db.Text
+  topicRestrictions  String?             @db.Text // JSON array or comma-separated
+  licenseId          String?             // e.g. "MIT", "Apache-2.0", "CC-BY-4.0"
+  licenseReference   String?             @db.Text // License URL or reference note
+  attribution        String?             @db.Text
+  contentReuseStatus ContentReuseStatus  @default(PERMITTED)
+  parserType         ParserType          @default(AUTO)
+  parserConfig       String?             @db.Text // JSON custom selector / rules
+  syncFrequency      SyncFrequency       @default(MONTHLY)
+  status             SourceStatus        @default(DRAFT)
+  isActive           Boolean             @default(true)
+  adminNotes         String?             @db.Text
+  lastSyncAt         DateTime?
+  nextSyncAt         DateTime?
+  lastSyncStatus     String?             // SUCCESS | FAILED | PARTIAL
+  lastError          String?             @db.Text
+  createdByAdminId   String?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  technologies       ContentSourceTechnology[]
+  documents          SourceDocument[]
+  batches            ContentImportBatch[]
+  questions          Question[]
+
+  @@index([sourceType])
+  @@index([status])
+  @@index([isActive])
+  @@index([nextSyncAt])
+  @@map("content_sources")
+}
+
+model ContentSourceTechnology {
+  id        String        @id @default(uuid())
+  sourceId  String
+  skillId   String
+  createdAt DateTime      @default(now())
+
+  source    ContentSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  skill     Skill         @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceId, skillId])
+  @@index([sourceId])
+  @@index([skillId])
+  @@map("content_source_technologies")
+}
+
+model SourceDocument {
+  id             String        @id @default(uuid())
+  sourceId       String
+  documentUrl    String        @db.Text
+  sourcePath     String?       // Relative path in repo or clean page path
+  sourceRevision String?       // Commit SHA, ETag, or version
+  contentHash    String        // SHA-256 of raw document content
+  status         String        @default("PENDING") // PENDING | PROCESSED | UNCHANGED | FAILED
+  errorMessage   String?       @db.Text
+  lastRetrievedAt DateTime     @default(now())
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  source         ContentSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  items          ContentImportItem[]
+  questions      Question[]
+
+  @@index([sourceId])
+  @@index([contentHash])
+  @@map("source_documents")
+}
+
+model ContentImportBatch {
+  id                  String              @id @default(uuid())
+  sourceId            String
+  batchType           String              @default("MANUAL_FETCH") // SCHEDULED_SYNC | MANUAL_FETCH | FILE_UPLOAD | NEW_SKILL_COLLECTION
+  status              String              @default("IN_PROGRESS") // IN_PROGRESS | COMPLETED | FAILED | PARTIALLY_FAILED
+  totalDiscovered     Int                 @default(0)
+  newItemsCount       Int                 @default(0)
+  changedItemsCount   Int                 @default(0)
+  duplicateItemsCount Int                 @default(0)
+  rejectedItemsCount  Int                 @default(0)
+  errorsCount         Int                 @default(0)
+  startedAt           DateTime            @default(now())
+  completedAt         DateTime?
+  errorMessage        String?             @db.Text
+  errorReport         String?             @db.LongText // JSON array of sanitized errors
+  initiatedByAdminId  String?
+  createdAt           DateTime            @default(now())
+
+  source              ContentSource       @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  items               ContentImportItem[]
+
+  @@index([sourceId])
+  @@index([status])
+  @@index([startedAt])
+  @@map("content_import_batches")
+}
+
+model ContentImportItem {
+  id                  String             @id @default(uuid())
+  batchId             String
+  sourceDocumentId    String?
+  rawContent          String?            @db.MediumText
+  normalizedQuestion  String             @db.Text
+  normalizedAnswer    String             @db.MediumText
+  contentHash         String             // SHA-256
+  detectedTechnology  String?
+  matchedSkillId      String?
+  topic               String?
+  subtopic            String?
+  difficulty          DifficultyLevel    @default(UNKNOWN)
+  questionType        QuestionType       @default(SHORT_ANSWER)
+  options             String?            @db.Text // JSON array of options
+  correctOption       String?
+  explanation         String?            @db.Text
+  tags                String?            @db.Text // JSON array of tags
+  sourceUrl           String?            @db.Text
+  validationErrors    String?            @db.Text // JSON array of validation issues
+  isDuplicate         Boolean            @default(false)
+  duplicateMatchId    String?            // Matches an existing Question ID
+  duplicateScore      Float?
+  duplicateDifference String?            @db.Text // Diff summary or note
+  reviewStatus        ReviewStatus       @default(PENDING)
+  publishedQuestionId String?
+  reviewNotes         String?            @db.Text
+  reviewedByAdminId   String?
+  reviewedAt          DateTime?
+  createdAt           DateTime           @default(now())
+
+  batch               ContentImportBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  sourceDocument      SourceDocument?    @relation(fields: [sourceDocumentId], references: [id], onDelete: SetNull)
+  matchedSkill        Skill?             @relation(fields: [matchedSkillId], references: [id], onDelete: SetNull)
+  publishedQuestion   Question?          @relation("ImportItemPublishedQuestion", fields: [publishedQuestionId], references: [id], onDelete: SetNull)
+
+  @@index([batchId])
+  @@index([reviewStatus])
+  @@index([contentHash])
+  @@index([matchedSkillId])
+  @@map("content_import_items")
+}
+
+model Question {
+  id                 String              @id @default(uuid())
+  technologyId       String
+  topic              String
+  subtopic           String?
+  questionText       String              @db.Text
+  answerContent      String              @db.MediumText
+  explanation        String?             @db.Text
+  difficulty         DifficultyLevel     @default(UNKNOWN)
+  questionType       QuestionType        @default(SHORT_ANSWER)
+  options            String?             @db.Text // JSON array
+  correctOption      String?
+  tags               String?             @db.Text // JSON array
+  sourceId           String?
+  sourceDocumentId   String?
+  sourceUrl          String?             @db.Text
+  licenseSnapshot    String?             @db.Text // JSON object
+  externalContentId  String?
+  contentHash        String              // SHA-256
+  sourceRevision     String?
+  reviewStatus       ReviewStatus        @default(APPROVED)
+  reviewedByAdminId  String?
+  publishedAt        DateTime?
+  lastVerifiedAt     DateTime?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  technology         Skill               @relation(fields: [technologyId], references: [id], onDelete: Restrict)
+  source             ContentSource?      @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  sourceDocument     SourceDocument?     @relation(fields: [sourceDocumentId], references: [id], onDelete: SetNull)
+  provenances        QuestionProvenance[]
+  importItems        ContentImportItem[] @relation("ImportItemPublishedQuestion")
+
+  @@index([technologyId])
+  @@index([topic])
+  @@index([difficulty])
+  @@index([questionType])
+  @@index([reviewStatus])
+  @@index([contentHash])
+  @@index([sourceId])
+  @@map("questions")
+}
+
+model QuestionProvenance {
+  id             String    @id @default(uuid())
+  questionId     String
+  sourceId       String?
+  sourceUrl      String?   @db.Text
+  sourceRevision String?
+  retrievedAt    DateTime  @default(now())
+  attribution    String?   @db.Text
+  licenseId      String?
+
+  question       Question  @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@index([questionId])
+  @@map("question_provenances")
+}
+
+model ContentCoverageTask {
+  id        String   @id @default(uuid())
+  skillId   String   @unique
+  status    String   @default("PENDING") // PENDING | IN_PROGRESS | RESOLVED
+  notes     String?  @db.Text
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  skill     Skill    @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@map("content_coverage_tasks")
 }

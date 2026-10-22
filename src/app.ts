@@ -5,6 +5,8 @@ import { authMiddleware } from './lib/auth/session.js';
 import authRoutes from './routes/auth.routes.js';
 import resumeRoutes from './routes/resume.routes.js';
 import adminRoutes from './routes/admin.routes.js';
+import qaAdminRoutes from './routes/qa-admin.routes.js';
+import { questionsRouter, technologiesRouter } from './routes/qa-public.routes.js';
 
 const app = express();
 
@@ -43,6 +45,9 @@ app.use('/api/auth', authRoutes);
 app.use('/api/resumes', resumeRoutes);
 app.use('/api/resume-analyses', resumeRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/admin', qaAdminRoutes);
+app.use('/api/questions', questionsRouter);
+app.use('/api/technologies', technologiesRouter);
 
 // Global Error Handler
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
