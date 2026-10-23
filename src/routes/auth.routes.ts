@@ -5,6 +5,7 @@ import { prisma } from '../lib/db.js';
 import { setAuthCookie, clearAuthCookie, requireAuth } from '../lib/auth/session.js';
 import { EmailService } from '../lib/email/email-service.js';
 import { GoogleAuthService } from '../lib/auth/google-auth-service.js';
+import { authRateLimiter } from '../lib/security/rate-limiter.js';
 
 const router = Router();
 
@@ -79,7 +80,7 @@ async function claimGuestData(userId: string, guestSessionId: string | undefined
 }
 
 // POST /api/auth/register
-router.post('/register', async (req: Request, res: Response) => {
+router.post('/register', authRateLimiter, async (req: Request, res: Response) => {
   try {
     const parsed = RegisterSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -156,7 +157,7 @@ router.post('/register', async (req: Request, res: Response) => {
 });
 
 // POST /api/auth/login
-router.post('/login', async (req: Request, res: Response) => {
+router.post('/login', authRateLimiter, async (req: Request, res: Response) => {
   try {
     const parsed = LoginSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -527,7 +528,7 @@ router.post('/google/unlink', requireAuth, async (req: Request, res: Response) =
 });
 
 // POST /api/auth/verify-email
-router.post('/verify-email', async (req: Request, res: Response) => {
+router.post('/verify-email', authRateLimiter, async (req: Request, res: Response) => {
   try {
     const parsed = VerifyEmailSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -589,7 +590,7 @@ router.post('/verify-email', async (req: Request, res: Response) => {
 });
 
 // POST /api/auth/resend-verification
-router.post('/resend-verification', async (req: Request, res: Response) => {
+router.post('/resend-verification', authRateLimiter, async (req: Request, res: Response) => {
   try {
     const parsed = ResendVerificationSchema.safeParse(req.body);
     const targetEmail = parsed.success && parsed.data.email
@@ -662,7 +663,7 @@ router.post('/resend-verification', async (req: Request, res: Response) => {
 });
 
 // POST /api/auth/forgot-password
-router.post('/forgot-password', async (req: Request, res: Response) => {
+router.post('/forgot-password', authRateLimiter, async (req: Request, res: Response) => {
   try {
     const parsed = ForgotPasswordSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -726,7 +727,7 @@ router.post('/forgot-password', async (req: Request, res: Response) => {
 });
 
 // POST /api/auth/reset-password
-router.post('/reset-password', async (req: Request, res: Response) => {
+router.post('/reset-password', authRateLimiter, async (req: Request, res: Response) => {
   try {
     const parsed = ResetPasswordSchema.safeParse(req.body);
     if (!parsed.success) {

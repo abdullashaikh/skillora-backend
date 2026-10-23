@@ -191,7 +191,7 @@ export class ContentSourceService {
     technologyId?: string;
     search?: string;
   } = {}) {
-    return prisma.contentSource.findMany({
+    const sources = await prisma.contentSource.findMany({
       where: {
         ...(filters.status ? { status: filters.status } : {}),
         ...(filters.sourceType ? { sourceType: filters.sourceType } : {}),
@@ -217,10 +217,28 @@ export class ContentSourceService {
           include: { skill: true },
         },
         _count: {
-          select: { questions: true, documents: true },
+          select: { questions: true, documents: true, batches: true },
+        },
+        batches: {
+          select: {
+            id: true,
+            items: {
+              where: { reviewStatus: ReviewStatus.PENDING },
+              select: { id: true },
+            },
+          },
         },
       },
       orderBy: { createdAt: 'desc' },
+    });
+
+    return sources.map((s) => {
+      const stagedCount = s.batches.reduce((acc, b) => acc + (b.items?.length || 0), 0);
+      const { batches, ...rest } = s;
+      return {
+        ...rest,
+        stagedCount,
+      };
     });
   }
 
@@ -231,6 +249,46 @@ export class ContentSourceService {
     const source = await this.getSourceById(id);
     if (!source.url) throw new Error('Source does not have a configured URL.');
 
+    // If questions or staged items already exist in database for this source, return them directly
+    const existingStagedCount = await prisma.contentImportItem.count({
+      where: { batch: { sourceId: id } },
+    });
+    const existingPublishedCount = await prisma.question.count({
+      where: { sourceId: id },
+    });
+
+    const firstSkillName = source.technologies[0]?.skill.canonicalName;
+
+    if (existingStagedCount > 0 || existingPublishedCount > 0) {
+      const stagedItems = await prisma.contentImportItem.findMany({
+        where: { batch: { sourceId: id } },
+        take: 50,
+        orderBy: { createdAt: 'desc' },
+        include: { matchedSkill: true },
+      });
+
+      return {
+        source,
+        documentsCount: source._count?.documents || 1,
+        totalQuestionsFound: existingStagedCount + existingPublishedCount,
+        stagedCount: existingStagedCount,
+        publishedCount: existingPublishedCount,
+        questions: stagedItems.map((item) => ({
+          id: item.id,
+          normalizedQuestion: item.normalizedQuestion,
+          normalizedAnswer: item.normalizedAnswer,
+          topic: item.topic,
+          subtopic: item.subtopic,
+          difficulty: item.difficulty,
+          questionType: item.questionType,
+          detectedTechnology: item.detectedTechnology || item.matchedSkill?.canonicalName || firstSkillName || 'React',
+          reviewStatus: item.reviewStatus,
+          sourceUrl: item.sourceUrl,
+        })),
+        isExistingData: true,
+      };
+    }
+
     const defaultLicense: LicenseSnapshot = {
       licenseId: source.licenseId || 'UNVERIFIED',
       licenseName: source.licenseId || 'Source License',
@@ -240,8 +298,6 @@ export class ContentSourceService {
       retrievedAt: new Date().toISOString(),
       isRedistributable: source.contentReuseStatus === ContentReuseStatus.PERMITTED,
     };
-
-    const firstSkillName = source.technologies[0]?.skill.canonicalName;
 
     if (source.sourceType === SourceType.GITHUB_REPO || source.sourceType === SourceType.GITHUB_FILE) {
       const collectedDocs = await GitHubSourceAdapter.collect(source.url, { maxFiles: 2 });

@@ -429,6 +429,22 @@ router.post('/questions/staged/batch-publish', async (req: Request, res: Respons
   }
 });
 
+// POST /api/admin/questions/staged/publish-all
+router.post('/questions/staged/publish-all', async (req: Request, res: Response) => {
+  try {
+    const adminId = req.auth!.user!.id;
+    const { batchId, sourceId, technologyId, onlyNonDuplicates } = req.body;
+    const result = await QuestionReviewService.publishAllFiltered(
+      { batchId, sourceId, technologyId, onlyNonDuplicates },
+      adminId
+    );
+    return res.json({ success: true, result });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Publish all failed';
+    return res.status(400).json({ error: msg });
+  }
+});
+
 // POST /api/admin/questions/staged/bulk-publish
 router.post('/questions/staged/bulk-publish', async (req: Request, res: Response) => {
   try {
@@ -611,13 +627,13 @@ router.get('/technologies/coverage', async (_req: Request, res: Response) => {
 router.post('/technologies', async (req: Request, res: Response) => {
   try {
     const { canonicalName, category, aliases } = req.body;
-    if (!canonicalName || !category) {
-      return res.status(400).json({ error: 'canonicalName and category are required.' });
+    if (!canonicalName || typeof canonicalName !== 'string' || !canonicalName.trim()) {
+      return res.status(400).json({ error: 'canonicalName is required.' });
     }
 
     const result = await ContentScheduler.onNewTechnologyAdded({
-      canonicalName,
-      category,
+      canonicalName: canonicalName.trim(),
+      category: (category && typeof category === 'string' && category.trim()) || 'General',
       aliases,
     });
 

@@ -7,6 +7,7 @@ import { AIProviderService } from '../lib/ai/ai-provider-service.js';
 import { normalizeSkills } from '../lib/scoring/skill-normalizer.js';
 import { ScoringEngine, QualityWeights, JobMatchWeights } from '../lib/scoring/scoring-engine.js';
 import { StructuredResumeExtractionSchema } from '../lib/ai/types.js';
+import { resumeUploadRateLimiter } from '../lib/security/rate-limiter.js';
 
 const router = Router();
 const upload = multer({
@@ -14,42 +15,56 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
 });
 
+// In-flight concurrency lock to prevent parallel race conditions on guest quotas
+const inFlightGuestUploads = new Set<string>();
+
 // POST /api/resumes/analyze
-router.post('/analyze', upload.single('file'), async (req: Request, res: Response) => {
-  try {
-    const auth = req.auth;
-    if (!auth) {
-      return res.status(400).json({ error: 'Session context missing.' });
+router.post('/analyze', resumeUploadRateLimiter, upload.single('file'), async (req: Request, res: Response) => {
+  const auth = req.auth;
+  if (!auth) {
+    return res.status(400).json({ error: 'Session context missing.' });
+  }
+
+  // 1. Quotas & Concurrency Locks (1 analysis allowed per guest session)
+  const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  if (auth.isGuest) {
+    if (inFlightGuestUploads.has(auth.guestSessionId)) {
+      return res.status(429).json({
+        error: 'An analysis is already in progress for your guest session. Please wait for it to complete.',
+        isQuotaReached: true,
+      });
     }
 
-    // 1. Quotas (1 successful analysis allowed per guest session)
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    if (auth.isGuest) {
-      const recentGuestCount = await prisma.resumeAnalysis.count({
-        where: {
-          guestSessionId: auth.guestSessionId,
-          status: 'COMPLETED',
-        },
+    const recentGuestCount = await prisma.resumeAnalysis.count({
+      where: {
+        guestSessionId: auth.guestSessionId,
+        status: { in: ['COMPLETED', 'PROCESSING', 'PENDING'] },
+      },
+    });
+    if (recentGuestCount >= 1) {
+      return res.status(429).json({
+        error: 'Guest analysis limit reached (1 resume per guest session). Please create a free account or log in to unlock full reports and unlimited analyses.',
+        isQuotaReached: true,
       });
-      if (recentGuestCount >= 1) {
-        return res.status(429).json({
-          error: 'Guest analysis limit reached (1 resume per guest session). Please create a free account or log in to unlock full reports and unlimited analyses.',
-          isQuotaReached: true,
-        });
-      }
-    } else if (auth.user) {
-      const recentUserCount = await prisma.resumeAnalysis.count({
-        where: {
-          userId: auth.user.id,
-          createdAt: { gte: oneDayAgo },
-        },
-      });
-      if (recentUserCount >= 50) {
-        return res.status(429).json({
-          error: 'Daily analysis limit reached (50 analyses). Please try again tomorrow.',
-        });
-      }
     }
+
+    // Acquire lock for this guest session
+    inFlightGuestUploads.add(auth.guestSessionId);
+  } else if (auth.user) {
+    const recentUserCount = await prisma.resumeAnalysis.count({
+      where: {
+        userId: auth.user.id,
+        createdAt: { gte: oneDayAgo },
+      },
+    });
+    if (recentUserCount >= 50) {
+      return res.status(429).json({
+        error: 'Daily analysis limit reached (50 analyses). Please try again tomorrow.',
+      });
+    }
+  }
+
+  try {
 
     // 2. Validate uploaded file
     const file = req.file;
@@ -244,10 +259,14 @@ router.post('/analyze', upload.single('file'), async (req: Request, res: Respons
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : 'An error occurred during resume analysis.';
     return res.status(500).json({ error: errorMsg });
+  } finally {
+    if (auth.isGuest) {
+      inFlightGuestUploads.delete(auth.guestSessionId);
+    }
   }
 });
 
-// GET /api/resume-analyses (List)
+// GET /api/resume-analyses (List with Server-Side Pagination)
 router.get('/', async (req: Request, res: Response) => {
   try {
     const auth = req.auth;
@@ -265,15 +284,27 @@ router.get('/', async (req: Request, res: Response) => {
       // non-blocking
     }
 
+    const page = Math.max(1, parseInt((req.query.page as string) || '1', 10));
+    const limit = Math.min(50, Math.max(1, parseInt((req.query.limit as string) || '10', 10)));
+    const skip = (page - 1) * limit;
+
     if (auth.user) {
-      const analyses = await prisma.resumeAnalysis.findMany({
-        where: { userId: auth.user.id },
-        include: {
-          resume: { select: { originalName: true, fileSize: true, mimeType: true } },
-        },
-        orderBy: { createdAt: 'desc' },
-        take: 50,
-      });
+      const [totalCount, analyses] = await Promise.all([
+        prisma.resumeAnalysis.count({
+          where: { userId: auth.user.id },
+        }),
+        prisma.resumeAnalysis.findMany({
+          where: { userId: auth.user.id },
+          include: {
+            resume: { select: { originalName: true, fileSize: true, mimeType: true } },
+          },
+          orderBy: { createdAt: 'desc' },
+          skip,
+          take: limit,
+        }),
+      ]);
+
+      const totalPages = Math.max(1, Math.ceil(totalCount / limit));
 
       return res.json({
         analyses: analyses.map((a) => ({
@@ -285,21 +316,39 @@ router.get('/', async (req: Request, res: Response) => {
           createdAt: a.createdAt,
           status: a.status,
         })),
+        pagination: {
+          page,
+          limit,
+          totalCount,
+          totalPages,
+          hasMore: page < totalPages,
+        },
         isGuest: false,
       });
     }
 
-    const guestAnalyses = await prisma.resumeAnalysis.findMany({
-      where: {
-        guestSessionId: auth.guestSessionId,
-        expiresAt: { gt: new Date() },
-      },
-      include: {
-        resume: { select: { originalName: true, fileSize: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 10,
-    });
+    const [guestTotal, guestAnalyses] = await Promise.all([
+      prisma.resumeAnalysis.count({
+        where: {
+          guestSessionId: auth.guestSessionId,
+          expiresAt: { gt: new Date() },
+        },
+      }),
+      prisma.resumeAnalysis.findMany({
+        where: {
+          guestSessionId: auth.guestSessionId,
+          expiresAt: { gt: new Date() },
+        },
+        include: {
+          resume: { select: { originalName: true, fileSize: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+    ]);
+
+    const guestTotalPages = Math.max(1, Math.ceil(guestTotal / limit));
 
     return res.json({
       analyses: guestAnalyses.map((a) => ({
@@ -311,6 +360,13 @@ router.get('/', async (req: Request, res: Response) => {
         expiresAt: a.expiresAt,
         status: a.status,
       })),
+      pagination: {
+        page,
+        limit,
+        totalCount: guestTotal,
+        totalPages: guestTotalPages,
+        hasMore: page < guestTotalPages,
+      },
       isGuest: true,
     });
   } catch (err: unknown) {

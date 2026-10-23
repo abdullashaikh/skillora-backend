@@ -2,6 +2,8 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import { authMiddleware } from './lib/auth/session.js';
+import { securityHeadersMiddleware } from './lib/security/headers.js';
+import { generalApiRateLimiter } from './lib/security/rate-limiter.js';
 import authRoutes from './routes/auth.routes.js';
 import resumeRoutes from './routes/resume.routes.js';
 import adminRoutes from './routes/admin.routes.js';
@@ -15,14 +17,22 @@ const allowedOrigins = [
   process.env.ADMIN_URL || 'http://localhost:3001',
 ];
 
+// Security Headers (OWASP)
+app.use(securityHeadersMiddleware);
+
 app.use(
   cors({
     origin: (origin, callback) => {
-      // allow requests with no origin (like mobile apps, curl, or same-origin)
+      // Allow requests with no origin (like mobile apps, curl, server-to-server)
       if (!origin || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
-      return callback(null, true); // Permissive in dev, restrictable in prod
+      // Strictly block unknown origins in production
+      if (process.env.NODE_ENV === 'production') {
+        return callback(new Error(`Origin ${origin} is not allowed by CORS.`));
+      }
+      // Permissive during local development and test mode
+      return callback(null, true);
     },
     credentials: true,
   })
@@ -34,6 +44,9 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Global authentication & guest session resolver
 app.use(authMiddleware);
+
+// Global rate limiting on API paths
+app.use('/api', generalApiRateLimiter);
 
 // Health check
 app.get('/health', (_req: Request, res: Response) => {

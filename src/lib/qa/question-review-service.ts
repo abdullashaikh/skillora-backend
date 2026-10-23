@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { prisma } from '../db.js';
 import { DuplicateDetectionService } from './duplicate-detection-service.js';
 import {
@@ -276,23 +277,105 @@ export class QuestionReviewService {
    * Bulk publishes clean approved items from a batch.
    */
   public static async batchPublish(batchId: string, adminId: string, onlyNonDuplicates = true) {
+    return this.publishAllFiltered({ batchId, onlyNonDuplicates }, adminId);
+  }
+
+  /**
+   * Publishes all pending staged items matching the given filters (batch, source, technology)
+   * in optimized chunks.
+   */
+  public static async publishAllFiltered(
+    filters: { batchId?: string; sourceId?: string; technologyId?: string; onlyNonDuplicates?: boolean },
+    adminId: string
+  ) {
+    const whereClause: any = {
+      reviewStatus: ReviewStatus.PENDING,
+      matchedSkillId: { not: null },
+      ...(filters.onlyNonDuplicates ? { isDuplicate: false } : {}),
+      ...(filters.batchId ? { batchId: filters.batchId } : {}),
+      ...(filters.technologyId ? { matchedSkillId: filters.technologyId } : {}),
+      ...(filters.sourceId ? { batch: { sourceId: filters.sourceId } } : {}),
+    };
+
     const items = await prisma.contentImportItem.findMany({
-      where: {
-        batchId,
-        reviewStatus: ReviewStatus.PENDING,
-        matchedSkillId: { not: null },
-        ...(onlyNonDuplicates ? { isDuplicate: false } : {}),
+      where: whereClause,
+      include: {
+        batch: { include: { source: true } },
       },
+      orderBy: { createdAt: 'asc' },
     });
 
+    if (items.length === 0) {
+      return { totalMatched: 0, publishedCount: 0 };
+    }
+
     let publishedCount = 0;
-    for (const item of items) {
-      try {
-        await this.publishStagedItem(item.id, adminId);
-        publishedCount++;
-      } catch {
-        // Individual item failure
-      }
+    const CHUNK_SIZE = 25;
+
+    for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+      const chunk = items.slice(i, i + CHUNK_SIZE);
+      const itemPublishedMap: Array<{ itemId: string; questionId: string }> = [];
+
+      const questionRows = chunk.map((item) => {
+        const qId = crypto.randomUUID();
+        itemPublishedMap.push({ itemId: item.id, questionId: qId });
+
+        const source = item.batch.source;
+        let licenseSnapshotStr = null;
+        try {
+          if (item.rawContent) {
+            const parsed = JSON.parse(item.rawContent);
+            if (parsed.licenseSnapshot) {
+              licenseSnapshotStr = JSON.stringify(parsed.licenseSnapshot);
+            }
+          }
+        } catch {}
+
+        return {
+          id: qId,
+          technologyId: item.matchedSkillId!,
+          topic: item.topic || 'General',
+          subtopic: item.subtopic,
+          questionText: item.normalizedQuestion,
+          answerContent: item.normalizedAnswer,
+          explanation: item.explanation,
+          difficulty: item.difficulty,
+          questionType: item.questionType,
+          options: item.options,
+          correctOption: item.correctOption,
+          tags: item.tags,
+          sourceId: source.id,
+          sourceDocumentId: item.sourceDocumentId,
+          sourceUrl: item.sourceUrl || source.url,
+          licenseSnapshot: licenseSnapshotStr,
+          contentHash: item.contentHash,
+          reviewStatus: ReviewStatus.APPROVED,
+          reviewedByAdminId: adminId,
+          publishedAt: new Date(),
+          lastVerifiedAt: new Date(),
+        };
+      });
+
+      await prisma.$transaction(
+        async (tx) => {
+          await tx.question.createMany({ data: questionRows });
+
+          for (const pair of itemPublishedMap) {
+            await tx.contentImportItem.update({
+              where: { id: pair.itemId },
+              data: {
+                reviewStatus: ReviewStatus.APPROVED,
+                publishedQuestionId: pair.questionId,
+                reviewedByAdminId: adminId,
+                reviewedAt: new Date(),
+              },
+            });
+          }
+        },
+        { timeout: 30000, maxWait: 10000 }
+      );
+
+      publishedCount += chunk.length;
     }
 
     return { totalMatched: items.length, publishedCount };

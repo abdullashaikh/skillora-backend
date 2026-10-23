@@ -65,9 +65,40 @@ router.put('/ai-config', async (req: Request, res: Response) => {
     let encryptedData = undefined;
     let masked = undefined;
 
-    if (apiKey && apiKey.trim().length > 5) {
-      const encrypted = encryptSecret(apiKey.trim());
-      masked = maskApiKey(apiKey.trim());
+    if (apiKey && apiKey.trim().length > 0) {
+      const trimmedKey = apiKey.trim();
+
+      // Format validation to prevent saving corrupted strings
+      if (provider === 'OPENAI') {
+        if (!trimmedKey.startsWith('sk-') || trimmedKey.length < 20) {
+          return res.status(400).json({
+            error: 'Invalid OpenAI API key format. Keys must start with "sk-" and be at least 20 characters.',
+          });
+        }
+      } else if (provider === 'GEMINI') {
+        if (trimmedKey.length < 15 || !/^[A-Za-z0-9_-]+$/.test(trimmedKey)) {
+          return res.status(400).json({
+            error: 'Invalid Gemini API key format. Keys must be alphanumeric and at least 15 characters.',
+          });
+        }
+      }
+
+      // Pre-flight connection test if requested
+      if (req.body.testBeforeSave === true) {
+        const testRes = await AIProviderService.testConnection(
+          provider,
+          trimmedKey,
+          selectedModel
+        );
+        if (!testRes.success) {
+          return res.status(400).json({
+            error: `Connection test failed for ${provider}: ${testRes.message}. Credential not saved.`,
+          });
+        }
+      }
+
+      const encrypted = encryptSecret(trimmedKey);
+      masked = maskApiKey(trimmedKey);
       encryptedData = {
         encryptedKey: encrypted.ciphertext,
         iv: encrypted.iv,
@@ -509,54 +540,92 @@ router.get('/system-health', async (_req: Request, res: Response) => {
   }
 });
 
-// GET /api/admin/ai-usage
+// GET /api/admin/ai-usage (with Server-Side Pagination)
 router.get('/ai-usage', async (req: Request, res: Response) => {
   try {
-    const limit = Math.min(100, parseInt((req.query.limit as string) || '50', 10));
-    const logs = await prisma.aIUsageLog.findMany({
-      orderBy: { createdAt: 'desc' },
-      take: limit,
-      select: {
-        id: true,
-        provider: true,
-        model: true,
-        durationMs: true,
-        status: true,
-        inputTokens: true,
-        outputTokens: true,
-        totalTokens: true,
-        estimatedCostUsd: true,
-        errorMessage: true,
-        isGuest: true,
-        createdAt: true,
+    const page = Math.max(1, parseInt((req.query.page as string) || '1', 10));
+    const limit = Math.min(100, Math.max(1, parseInt((req.query.limit as string) || '50', 10)));
+    const skip = (page - 1) * limit;
+
+    const [totalCount, logs] = await Promise.all([
+      prisma.aIUsageLog.count(),
+      prisma.aIUsageLog.findMany({
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+        select: {
+          id: true,
+          provider: true,
+          model: true,
+          durationMs: true,
+          status: true,
+          inputTokens: true,
+          outputTokens: true,
+          totalTokens: true,
+          estimatedCostUsd: true,
+          errorMessage: true,
+          isGuest: true,
+          createdAt: true,
+        },
+      }),
+    ]);
+
+    const totalPages = Math.max(1, Math.ceil(totalCount / limit));
+
+    return res.json({
+      logs,
+      pagination: {
+        page,
+        limit,
+        totalCount,
+        totalPages,
+        hasMore: page < totalPages,
       },
     });
-    return res.json({ logs });
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : 'Failed to fetch usage logs';
     return res.status(500).json({ error: errorMsg });
   }
 });
 
-// GET /api/admin/audit-logs
+// GET /api/admin/audit-logs (with Server-Side Pagination)
 router.get('/audit-logs', async (req: Request, res: Response) => {
   try {
-    const limit = Math.min(100, parseInt((req.query.limit as string) || '50', 10));
-    const logs = await prisma.adminAuditLog.findMany({
-      orderBy: { createdAt: 'desc' },
-      take: limit,
-      select: {
-        id: true,
-        adminEmail: true,
-        action: true,
-        resourceType: true,
-        resourceId: true,
-        details: true,
-        outcome: true,
-        createdAt: true,
+    const page = Math.max(1, parseInt((req.query.page as string) || '1', 10));
+    const limit = Math.min(100, Math.max(1, parseInt((req.query.limit as string) || '50', 10)));
+    const skip = (page - 1) * limit;
+
+    const [totalCount, logs] = await Promise.all([
+      prisma.adminAuditLog.count(),
+      prisma.adminAuditLog.findMany({
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+        select: {
+          id: true,
+          adminEmail: true,
+          action: true,
+          resourceType: true,
+          resourceId: true,
+          details: true,
+          outcome: true,
+          createdAt: true,
+        },
+      }),
+    ]);
+
+    const totalPages = Math.max(1, Math.ceil(totalCount / limit));
+
+    return res.json({
+      logs,
+      pagination: {
+        page,
+        limit,
+        totalCount,
+        totalPages,
+        hasMore: page < totalPages,
       },
     });
-    return res.json({ logs });
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : 'Failed to fetch audit logs';
     return res.status(500).json({ error: errorMsg });
